@@ -1,3 +1,11 @@
+# ================================
+# Production Stable Memory-Safe app.py
+# No transformers
+# No text2emotion
+# No NLTK
+# Same API contract
+# ================================
+
 import os
 import gc
 import re
@@ -9,12 +17,11 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import text2emotion as te
 
 warnings.filterwarnings("ignore")
 
 # ================================
-# MEMORY OPTIMIZATION SETTINGS
+# MEMORY SETTINGS
 # ================================
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -33,15 +40,84 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================================
-# LIGHTWEIGHT ANALYZERS
+# SENTIMENT ANALYZER
 # ================================
 
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
+# ================================
+# RULE-BASED EMOTION LEXICON
+# ================================
+
+EMOTION_LEXICON = {
+    "happy": "Happy",
+    "joy": "Happy",
+    "excited": "Happy",
+    "love": "Happy",
+    "glad": "Happy",
+    "sad": "Sad",
+    "depressed": "Sad",
+    "unhappy": "Sad",
+    "cry": "Sad",
+    "angry": "Angry",
+    "mad": "Angry",
+    "furious": "Angry",
+    "annoyed": "Angry",
+    "fear": "Fear",
+    "scared": "Fear",
+    "afraid": "Fear",
+    "nervous": "Fear",
+    "surprised": "Surprise",
+    "shocked": "Surprise",
+    "amazed": "Surprise"
+}
+
+# ================================
+# UTILITY FUNCTIONS
+# ================================
 
 def clear_memory():
     gc.collect()
 
+
+def detect_emotion_rule_based(text):
+    words = re.findall(r"\w+", text.lower())
+    counts = Counter()
+
+    for word in words:
+        if word in EMOTION_LEXICON:
+            counts[EMOTION_LEXICON[word]] += 1
+
+    if not counts:
+        return "Neutral", 0.5
+
+    dominant = counts.most_common(1)[0][0]
+    confidence = counts[dominant] / max(1, sum(counts.values()))
+
+    return dominant, round(confidence, 3)
+
+
+def compute_emotion_sentiment(text):
+    text = text[:512]
+
+    emotion_label, emotion_score = detect_emotion_rule_based(text)
+
+    sentiment_scores = sentiment_analyzer.polarity_scores(text)
+    compound = sentiment_scores["compound"]
+
+    if compound > 0.05:
+        sentiment_label = "POSITIVE"
+    elif compound < -0.05:
+        sentiment_label = "NEGATIVE"
+    else:
+        sentiment_label = "NEUTRAL"
+
+    return {
+        "primary_emotion": emotion_label,
+        "emotion_confidence": emotion_score,
+        "sentiment": sentiment_label,
+        "sentiment_score": round(abs(compound), 3)
+    }
 
 # ================================
 # ANALYSIS LAYERS
@@ -61,34 +137,6 @@ def layer1_audio_processing(text):
         "speaking_rate": round(words_per_minute, 1),
         "pauses_detected": text.count("...") + text.count(".."),
         "voice_quality": "Emphatic" if has_exclamation else "Neutral"
-    }
-
-
-def compute_emotion_sentiment(text):
-    text = text[:512]
-
-    # Emotion
-    emotions = te.get_emotion(text)
-    dominant_emotion = max(emotions, key=emotions.get)
-    emotion_score = emotions[dominant_emotion]
-
-    # Sentiment
-    sentiment_scores = sentiment_analyzer.polarity_scores(text)
-    compound = sentiment_scores["compound"]
-
-    if compound > 0.05:
-        sentiment_label = "POSITIVE"
-    elif compound < -0.05:
-        sentiment_label = "NEGATIVE"
-    else:
-        sentiment_label = "NEUTRAL"
-
-    return {
-        "primary_emotion": dominant_emotion,
-        "emotion_confidence": round(emotion_score, 3),
-        "sentiment": sentiment_label,
-        "sentiment_score": round(abs(compound), 3),
-        "all_emotions": emotions
     }
 
 
@@ -163,7 +211,7 @@ def layer4_emotional_journey(conversation, emotion_cache):
         })
 
     counts = Counter(emotions_over_time)
-    dominant = counts.most_common(1)[0][0] if counts else "Unknown"
+    dominant = counts.most_common(1)[0][0] if counts else "Neutral"
 
     shifts = sum(
         1 for i in range(1, len(emotions_over_time))
@@ -181,7 +229,6 @@ def layer4_emotional_journey(conversation, emotion_cache):
             "Low"
         )
     }
-
 
 # ================================
 # ROUTES
@@ -217,7 +264,6 @@ def analyze_conversation(session_id):
 
         user_msgs = [m for m in formatted if m["role"] == "user"]
 
-        # Compute emotion & sentiment ONCE
         emotion_cache = [compute_emotion_sentiment(m["text"]) for m in user_msgs]
 
         layer1 = [
