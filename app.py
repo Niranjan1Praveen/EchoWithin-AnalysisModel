@@ -7,7 +7,10 @@ import re
 from collections import Counter
 import numpy as np
 import os
+import gc
 from supabase import create_client, Client
+import warnings
+warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Next.js frontend
@@ -17,12 +20,54 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://hpumegppcvjhxgkavawh.supa
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhwdW1lZ3BwY3ZqaHhna2F2YXdoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk0MTE2MTcsImV4cCI6MjA4NDk4NzYxN30.JF_InceK-JR4LjVqebmNftlZGoXRM7Px-fQy_8mTu-c")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Load ML models (load once at startup)
-emotion_classifier = pipeline("text-classification", 
-                            model="j-hartmann/emotion-english-distilroberta-base")
-sentiment_classifier = pipeline("sentiment-analysis")
+# ============ MEMORY OPTIMIZATIONS ============
+# Set environment variables for memory optimization
+os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
-# Helper functions for analysis (MODIFIED to only analyze USER turns)
+# Force CPU and optimize memory
+device = -1  # Force CPU
+torch.set_num_threads(1)  # Limit CPU threads
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.5)  # Limit GPU memory if available
+
+# Load ML models with memory optimizations
+print("Loading emotion classifier model...")
+emotion_classifier = pipeline(
+    "text-classification", 
+    model="j-hartmann/emotion-english-distilroberta-base",
+    device=device,
+    model_kwargs={
+        "low_cpu_mem_usage": True,
+        "torch_dtype": torch.float32  # Use float32 for CPU
+    },
+    framework="pt"
+)
+
+print("Loading sentiment analysis model...")
+sentiment_classifier = pipeline(
+    "sentiment-analysis",
+    device=device,
+    model_kwargs={
+        "low_cpu_mem_usage": True,
+        "torch_dtype": torch.float32
+    },
+    framework="pt"
+)
+
+# Enable garbage collection after model loading
+gc.collect()
+print("Models loaded successfully!")
+
+# ============ HELPER FUNCTIONS ============
+def clear_memory():
+    """Helper function to clear memory after heavy operations"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def layer1_audio_processing(text):
     """Simulate audio analysis based on text patterns"""
     word_count = len(text.split())
@@ -43,6 +88,10 @@ def layer1_audio_processing(text):
 
 def layer2_semantic_analysis(text):
     """Analyze emotional content in text"""
+    # Process text in smaller chunks if it's very long
+    if len(text) > 512:  # Truncate long texts to save memory
+        text = text[:512]
+    
     emotions = emotion_classifier(text)[0]
     sentiment = sentiment_classifier(text)[0]
     
@@ -104,8 +153,12 @@ def layer4_emotional_journey(conversation):
     emotional_journey = []
     emotions_over_time = []
     
+    # Process messages one by one to avoid memory buildup
     for i, msg in enumerate(user_messages):
         text = msg['text']
+        if len(text) > 512:  # Truncate long texts
+            text = text[:512]
+            
         emotion_result = emotion_classifier(text)[0]
         sentiment_result = sentiment_classifier(text)[0]
         
@@ -120,6 +173,10 @@ def layer4_emotional_journey(conversation):
         })
         
         emotions_over_time.append(emotion_result['label'])
+        
+        # Clear memory periodically
+        if i % 5 == 0:
+            clear_memory()
     
     # Calculate overall metrics
     emotion_counts = Counter(emotions_over_time)
@@ -139,10 +196,14 @@ def layer4_emotional_journey(conversation):
         "emotional_stability": "High" if emotional_shifts < len(user_messages)/3 else "Medium" if emotional_shifts < len(user_messages)/2 else "Low"
     }
 
+# ============ ROUTES ============
 @app.route('/api/analyze/<session_id>', methods=['GET'])
 def analyze_conversation(session_id):
     """Fetch conversation from Supabase and analyze it"""
     try:
+        # Clear memory before heavy operation
+        clear_memory()
+        
         # Fetch conversation from Supabase
         response = supabase.table('Conversation') \
             .select('*') \
@@ -173,7 +234,8 @@ def analyze_conversation(session_id):
         # Perform analysis (only on user messages)
         user_messages = [msg for msg in formatted_conversation if msg['role'] == 'user']
         
-        # Layer 1: Audio analysis for each user message
+        # Process in batches to manage memory
+        # Layer 1: Audio analysis for each user message (lightweight)
         layer1_results = []
         for msg in user_messages:
             layer1_results.append({
@@ -182,20 +244,26 @@ def analyze_conversation(session_id):
                 "analysis": layer1_audio_processing(msg['text'])
             })
         
-        # Layer 2: Semantic analysis for each user message
+        # Layer 2: Semantic analysis for each user message (heavy)
         layer2_results = []
-        for msg in user_messages:
+        for i, msg in enumerate(user_messages):
             layer2_results.append({
                 "message_id": msg.get('timestamp', 0),
                 "text": msg['text'][:100] + "..." if len(msg['text']) > 100 else msg['text'],
                 "analysis": layer2_semantic_analysis(msg['text'])
             })
+            # Clear memory every 5 messages
+            if i % 5 == 0:
+                clear_memory()
         
-        # Layer 3: Conversation patterns
+        # Layer 3: Conversation patterns (lightweight)
         layer3_results = layer3_conversation_patterns(formatted_conversation)
         
-        # Layer 4: Emotional journey
+        # Layer 4: Emotional journey (heavy)
         layer4_results = layer4_emotional_journey(formatted_conversation)
+        
+        # Clear memory after heavy processing
+        clear_memory()
         
         # Overall metrics
         overall_metrics = {
@@ -246,7 +314,12 @@ def analyze_conversation(session_id):
         
     except Exception as e:
         print(f"Error: {str(e)}")
+        # Clear memory on error
+        clear_memory()
         return jsonify({"error": str(e)}), 500
+    finally:
+        # Always clear memory after request
+        clear_memory()
 
 @app.route('/api/sessions', methods=['GET'])
 def list_sessions():
@@ -280,7 +353,25 @@ def list_sessions():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "message": "Emotion Analysis API is running"})
+    return jsonify({
+        "status": "healthy", 
+        "message": "Emotion Analysis API is running",
+        "memory_optimized": True
+    })
+
+@app.before_request
+def before_request():
+    """Clear memory before each request"""
+    clear_memory()
+
+@app.after_request
+def after_request(response):
+    """Clear memory after each request"""
+    clear_memory()
+    return response
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Get port from environment variable for Render
+    port = int(os.environ.get('PORT', 5000))
+    # Run with debug=False for production
+    app.run(host='0.0.0.0', port=port, debug=False)
