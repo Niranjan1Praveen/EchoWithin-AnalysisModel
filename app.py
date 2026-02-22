@@ -1,8 +1,3 @@
-# ================================
-# Production Memory-Safe app.py
-# Same functionality as original
-# ================================
-
 import os
 import gc
 import re
@@ -12,8 +7,9 @@ from collections import Counter
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from transformers import pipeline
 from supabase import create_client, Client
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import text2emotion as te
 
 warnings.filterwarnings("ignore")
 
@@ -37,36 +33,10 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================================
-# LAZY LOADED MODELS
+# LIGHTWEIGHT ANALYZERS
 # ================================
 
-emotion_classifier = None
-sentiment_classifier = None
-
-
-def load_models():
-    """
-    Lazy load both models only once.
-    Prevents OOM before port binding.
-    """
-    global emotion_classifier, sentiment_classifier
-
-    if emotion_classifier is None:
-        print("Loading emotion model...")
-        emotion_classifier = pipeline(
-            "text-classification",
-            model="j-hartmann/emotion-english-distilroberta-base",
-            device=-1
-        )
-        gc.collect()
-
-    if sentiment_classifier is None:
-        print("Loading sentiment model...")
-        sentiment_classifier = pipeline(
-            "sentiment-analysis",
-            device=-1
-        )
-        gc.collect()
+sentiment_analyzer = SentimentIntensityAnalyzer()
 
 
 def clear_memory():
@@ -94,14 +64,35 @@ def layer1_audio_processing(text):
     }
 
 
-def layer2_semantic_analysis(text):
-    load_models()
-
+def compute_emotion_sentiment(text):
     text = text[:512]
 
-    emotion = emotion_classifier(text)[0]
-    sentiment = sentiment_classifier(text)[0]
+    # Emotion
+    emotions = te.get_emotion(text)
+    dominant_emotion = max(emotions, key=emotions.get)
+    emotion_score = emotions[dominant_emotion]
 
+    # Sentiment
+    sentiment_scores = sentiment_analyzer.polarity_scores(text)
+    compound = sentiment_scores["compound"]
+
+    if compound > 0.05:
+        sentiment_label = "POSITIVE"
+    elif compound < -0.05:
+        sentiment_label = "NEGATIVE"
+    else:
+        sentiment_label = "NEUTRAL"
+
+    return {
+        "primary_emotion": dominant_emotion,
+        "emotion_confidence": round(emotion_score, 3),
+        "sentiment": sentiment_label,
+        "sentiment_score": round(abs(compound), 3),
+        "all_emotions": emotions
+    }
+
+
+def layer2_semantic_analysis(text, precomputed):
     words = re.findall(r"\w+", text.lower())
     filtered = [w for w in words if len(w) > 3]
     key_phrases = Counter(filtered).most_common(3)
@@ -110,10 +101,10 @@ def layer2_semantic_analysis(text):
     sentences = [s.strip() for s in sentences if s.strip()]
 
     return {
-        "primary_emotion": emotion["label"],
-        "emotion_confidence": round(emotion["score"], 3),
-        "sentiment": sentiment["label"],
-        "sentiment_score": round(sentiment["score"], 3),
+        "primary_emotion": precomputed["primary_emotion"],
+        "emotion_confidence": precomputed["emotion_confidence"],
+        "sentiment": precomputed["sentiment"],
+        "sentiment_score": precomputed["sentiment_score"],
         "key_phrases": [k for k, _ in key_phrases],
         "sentence_count": len(sentences),
         "avg_words_per_sentence": round(
@@ -147,9 +138,7 @@ def layer3_conversation_patterns(conversation):
     }
 
 
-def layer4_emotional_journey(conversation):
-    load_models()
-
+def layer4_emotional_journey(conversation, emotion_cache):
     user_msgs = [m for m in conversation if m["role"] == "user"]
 
     if not user_msgs:
@@ -159,25 +148,19 @@ def layer4_emotional_journey(conversation):
     journey = []
 
     for i, msg in enumerate(user_msgs):
-        text = msg["text"][:512]
+        data = emotion_cache[i]
 
-        emotion = emotion_classifier(text)[0]
-        sentiment = sentiment_classifier(text)[0]
-
-        emotions_over_time.append(emotion["label"])
+        emotions_over_time.append(data["primary_emotion"])
 
         journey.append({
             "message_index": i,
             "timestamp": msg.get("timestamp", i * 30000),
-            "emotion": emotion["label"],
-            "emotion_score": round(emotion["score"], 3),
-            "sentiment": sentiment["label"],
-            "sentiment_score": round(sentiment["score"], 3),
-            "text_preview": text[:100] + "..." if len(text) > 100 else text
+            "emotion": data["primary_emotion"],
+            "emotion_score": data["emotion_confidence"],
+            "sentiment": data["sentiment"],
+            "sentiment_score": data["sentiment_score"],
+            "text_preview": msg["text"][:100] + "..." if len(msg["text"]) > 100 else msg["text"]
         })
-
-        if i % 3 == 0:
-            clear_memory()
 
     counts = Counter(emotions_over_time)
     dominant = counts.most_common(1)[0][0] if counts else "Unknown"
@@ -234,6 +217,9 @@ def analyze_conversation(session_id):
 
         user_msgs = [m for m in formatted if m["role"] == "user"]
 
+        # Compute emotion & sentiment ONCE
+        emotion_cache = [compute_emotion_sentiment(m["text"]) for m in user_msgs]
+
         layer1 = [
             {
                 "message_id": m["timestamp"],
@@ -247,13 +233,13 @@ def analyze_conversation(session_id):
             {
                 "message_id": m["timestamp"],
                 "text": m["text"][:100],
-                "analysis": layer2_semantic_analysis(m["text"])
+                "analysis": layer2_semantic_analysis(m["text"], emotion_cache[i])
             }
-            for m in user_msgs
+            for i, m in enumerate(user_msgs)
         ]
 
         layer3 = layer3_conversation_patterns(formatted)
-        layer4 = layer4_emotional_journey(formatted)
+        layer4 = layer4_emotional_journey(formatted, emotion_cache)
 
         overall_metrics = {
             "session_id": session_id,
@@ -302,37 +288,6 @@ def analyze_conversation(session_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/sessions", methods=["GET"])
-def list_sessions():
-    try:
-        user_id = request.args.get("user_id")
-
-        query = supabase.table("Conversation") \
-            .select("session_id, user_name, created_at, total_messages, total_duration") \
-            .order("created_at", desc=True)
-
-        if user_id:
-            query = query.eq("user_id", user_id)
-
-        response = query.execute()
-
-        sessions = [
-            {
-                "session_id": s["session_id"],
-                "user_name": s.get("user_name", "Anonymous"),
-                "date": s["created_at"],
-                "message_count": s.get("total_messages", 0),
-                "duration": s.get("total_duration", 0) // 1000
-            }
-            for s in response.data
-        ]
-
-        return jsonify({"success": True, "sessions": sessions})
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -340,10 +295,6 @@ def health_check():
         "full_functionality_enabled": True
     })
 
-
-# ================================
-# ENTRY POINT
-# ================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
