@@ -31,13 +31,19 @@ app = Flask(__name__)
 CORS(app)
 
 # ================================
-# SUPABASE CONFIG
+# SUPABASE CONFIG - FROM ENV ONLY
 # ================================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Validate Supabase configuration
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("WARNING: SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+    # You can choose to raise an error here if you want to fail fast
+    # raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 # ================================
 # SENTIMENT ANALYZER
@@ -234,9 +240,48 @@ def layer4_emotional_journey(conversation, emotion_cache):
 # ROUTES
 # ================================
 
+@app.route('/api/sessions', methods=['GET'])
+def list_sessions():
+    """List all available sessions for dropdown selection"""
+    try:
+        # Check if Supabase is configured
+        if not supabase:
+            return jsonify({"error": "Supabase not configured"}), 500
+            
+        user_id = request.args.get('user_id')  # Optional filter
+        
+        query = supabase.table('Conversation') \
+            .select('session_id, user_name, created_at, total_messages, total_duration') \
+            .order('created_at', desc=True)
+        
+        if user_id:
+            query = query.eq('user_id', user_id)
+        
+        response = query.execute()
+        
+        sessions = []
+        for session in response.data:
+            sessions.append({
+                "session_id": session['session_id'],
+                "user_name": session.get('user_name', 'Anonymous'),
+                "date": session['created_at'],
+                "message_count": session.get('total_messages', 0),
+                "duration": session.get('total_duration', 0) // 1000  # Convert to seconds
+            })
+        
+        return jsonify({"success": True, "sessions": sessions})
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/analyze/<session_id>", methods=["GET"])
 def analyze_conversation(session_id):
     try:
+        # Check if Supabase is configured
+        if not supabase:
+            return jsonify({"error": "Supabase not configured"}), 500
+            
         clear_memory()
 
         response = supabase.table("Conversation") \
@@ -269,7 +314,7 @@ def analyze_conversation(session_id):
         layer1 = [
             {
                 "message_id": m["timestamp"],
-                "text": m["text"][:100],
+                "text": m["text"][:100] + "..." if len(m["text"]) > 100 else m["text"],
                 "analysis": layer1_audio_processing(m["text"])
             }
             for m in user_msgs
@@ -278,7 +323,7 @@ def analyze_conversation(session_id):
         layer2 = [
             {
                 "message_id": m["timestamp"],
-                "text": m["text"][:100],
+                "text": m["text"][:100] + "..." if len(m["text"]) > 100 else m["text"],
                 "analysis": layer2_semantic_analysis(m["text"], emotion_cache[i])
             }
             for i, m in enumerate(user_msgs)
@@ -336,10 +381,24 @@ def analyze_conversation(session_id):
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
+    supabase_status = "configured" if supabase else "not configured"
     return jsonify({
         "status": "healthy",
+        "message": "Emotion Analysis API is running",
+        "supabase": supabase_status,
         "full_functionality_enabled": True
     })
+
+@app.before_request
+def before_request():
+    """Clear memory before each request"""
+    clear_memory()
+
+@app.after_request
+def after_request(response):
+    """Clear memory after each request"""
+    clear_memory()
+    return response
 
 
 if __name__ == "__main__":
